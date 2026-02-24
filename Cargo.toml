@@ -7,19 +7,24 @@ readme = "README.md"
 license = "MIT"
 authors = ["Your Name"]
 repository = "https://github.com/yourusername/cyber-timer"
-keywords = ["timer", "tui", "terminal", "cyberpunk", "cli"]
+keywords = ["timer", "terminal", "cyberpunk", "cli"]
 categories = ["command-line-utilities"]
 
+[dev-dependencies]
+insta = "1"
+
 [dependencies]
-chrono = "0.4"
-crossterm = "0.27"
-regex = "1.10"
-ratatui = "0.27"
-tui = "0.19"
 anyhow = "1.0"
-thiserror = "1.0"
-log = "0.4"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.27"
 env_logger = "0.10"
+log = "0.4"
+notify-rust = "4"
+ratatui = "0.27"
+regex = "1.10"
+rodio = "0.19"
+thiserror = "1.0"
 
 [features]
 default = []
