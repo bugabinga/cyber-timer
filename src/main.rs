@@ -8,8 +8,10 @@ use ratatui::{
     backend::CrosstermBackend,
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Style, Stylize},
-    widgets::{Block, BorderType, Borders, Paragraph, Row, Table, Widget},
+    prelude::Stylize,
+    style::Color,
+    style::Style,
+    widgets::{Block, BorderType, Borders, Paragraph, Widget},
     Terminal,
 };
 use regex::Regex;
@@ -29,12 +31,9 @@ mod colors {
     pub const BORDER: Color = Color::Rgb(255, 0, 128);
     pub const PINK_NEON: Color = Color::Rgb(255, 0, 255);
     pub const CYAN: Color = Color::Rgb(0, 255, 255);
-    pub const CYAN_ELEC: Color = Color::Rgb(0, 212, 255);
-    pub const PURPLE_NEON: Color = Color::Rgb(191, 0, 255);
     pub const GREEN: Color = Color::Rgb(0, 255, 127);
     pub const YELLOW: Color = Color::Rgb(255, 215, 0);
     pub const ORANGE: Color = Color::Rgb(255, 140, 0);
-    pub const RED: Color = Color::Rgb(255, 50, 50);
     pub const TEXT: Color = Color::Rgb(200, 200, 220);
     pub const TEXT_DIM: Color = Color::Rgb(100, 100, 130);
 }
@@ -122,6 +121,8 @@ fn create_bar(progress: f64, width: usize, elapsed_ms: u64) -> String {
         "░".repeat(width)
     } else if filled >= width {
         "█".repeat(width)
+    } else if filled == 1 {
+        format!("{}{}", edge, "░".repeat(empty))
     } else {
         format!("{}{}", "█".repeat(filled - 1), edge)
     }
@@ -135,12 +136,17 @@ struct TimerWidget<'a> {
 
 impl<'a> Widget for TimerWidget<'a> {
     fn render(self, area: ratatui::prelude::Rect, buf: &mut Buffer) {
+        // Need minimum size
+        if area.width < 40 || area.height < 5 {
+            return;
+        }
+
         // Simple layout: header | progress bars | footer
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Min(0),
+                Constraint::Min(3),
                 Constraint::Length(3),
             ])
             .split(area);
@@ -168,8 +174,17 @@ impl<'a> Widget for TimerWidget<'a> {
         // ═══════════════════════════════════════════
         // MAIN PROGRESS BARS
         // ═══════════════════════════════════════════
-        let bar_width = ((chunks[1].width as f64 * 0.7) as usize).max(20);
-        let bar_start = chunks[1].x + (chunks[1].width - bar_width as u16) / 2;
+
+        // Guard against too many timers
+        let num_timers = self.states.len().min(10);
+        if num_timers == 0 {
+            return;
+        }
+
+        let bar_width = ((chunks[1].width as f64 * 0.6) as usize)
+            .max(15)
+            .min(chunks[1].width as usize - 25);
+        let bar_start = chunks[1].x + (chunks[1].width.saturating_sub(bar_width as u16 + 25)) / 2;
 
         let border = Block::default()
             .borders(Borders::ALL)
@@ -182,14 +197,19 @@ impl<'a> Widget for TimerWidget<'a> {
         let inner = ratatui::prelude::Rect {
             x: chunks[1].x + 1,
             y: chunks[1].y + 1,
-            width: chunks[1].width - 2,
-            height: chunks[1].height - 2,
+            width: chunks[1].width.saturating_sub(2),
+            height: chunks[1].height.saturating_sub(2),
         };
 
-        let mut y = inner.y;
-        let bar_height_per_timer = ((inner.height - 1) / self.states.len().max(1) as u16).max(3);
+        // Calculate height per timer
+        let height_per_timer = inner.height / num_timers as u16;
+        if height_per_timer < 1 {
+            return;
+        }
 
-        for state in self.states.iter() {
+        let mut y = inner.y;
+
+        for state in self.states.iter().take(num_timers) {
             let rem = state.end_time - self.now;
             let expired = rem.num_milliseconds() <= 0;
 
@@ -208,14 +228,20 @@ impl<'a> Widget for TimerWidget<'a> {
             let pct = (progress * 100.0) as u32;
             let icon = if expired { "✓" } else { "▶" };
 
-            // Label
+            // Label (max 15 chars)
+            let label_text = if state.label.len() > 15 {
+                format!("{}...", &state.label[..12])
+            } else {
+                state.label.clone()
+            };
+
             let label_area = ratatui::prelude::Rect {
                 x: inner.x + 2,
                 y,
-                width: 20,
+                width: 18,
                 height: 1,
             };
-            Paragraph::new(format!("{} {}", icon, state.label))
+            Paragraph::new(format!("{} {}", icon, label_text))
                 .style(Style::default().fg(color).bold())
                 .render(label_area, buf);
 
@@ -238,11 +264,11 @@ impl<'a> Widget for TimerWidget<'a> {
                 width: 20,
                 height: 1,
             };
-            Paragraph::new(format!("{:>3}%  {}", pct, time_str))
+            Paragraph::new(format!("{:>3}% {}", pct, time_str))
                 .style(Style::default().fg(colors::TEXT_DIM))
                 .render(pct_area, buf);
 
-            y += bar_height_per_timer;
+            y += height_per_timer;
         }
 
         // ═══════════════════════════════════════════
@@ -283,7 +309,22 @@ impl<'a> Widget for TimerWidget<'a> {
     }
 }
 
-fn main() -> io::Result<()> {
+fn cleanup_terminal() {
+    // Try to restore terminal state - ignore errors
+    let _ = disable_raw_mode();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1000l");
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1002l");
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1049l");
+}
+
+fn main() {
+    // Set up panic hook to always clean up terminal
+    std::panic::set_hook(Box::new(|_| {
+        cleanup_terminal();
+        eprintln!("\nPanic occurred, terminal cleaned up.");
+    }));
+
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         println!("🎮 CyberTimer v0.1.0");
@@ -297,8 +338,11 @@ fn main() -> io::Result<()> {
         println!("  cyber-timer 25m 5m 25m  # pomodoro!");
         println!();
         println!("Controls: Enter/q = exit, Ctrl+C = force quit");
-        return Ok(());
+        return;
     }
+
+    // Limit number of timers
+    let args: Vec<String> = args.into_iter().take(10).collect();
 
     let mut states: Vec<TimerState> = args
         .iter()
@@ -320,19 +364,28 @@ fn main() -> io::Result<()> {
         })
         .collect();
 
+    // Set up terminal
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    enable_raw_mode()?;
+    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+    let _ = enable_raw_mode();
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            cleanup_terminal();
+            eprintln!("Failed to create terminal: {}", e);
+            return;
+        }
+    };
 
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let running_clone = running.clone();
 
-    thread::spawn(move || {
+    // Input handling thread
+    let input_thread = thread::spawn(move || {
         while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            if event::poll(Duration::from_millis(10)).unwrap_or(false) {
+            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
                 if let Ok(Event::Key(key)) = event::read() {
                     if key.kind == KeyEventKind::Press {
                         if key.code == KeyCode::Char('q') || key.code == KeyCode::Enter {
@@ -350,62 +403,68 @@ fn main() -> io::Result<()> {
     });
 
     let start = Instant::now();
+    let mut last_state = Vec::new();
 
-    loop {
-        if !running.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-
-        let now = Local::now();
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-
-        terminal.draw(|f| {
-            f.render_widget(
-                TimerWidget {
-                    states: &states,
-                    now,
-                    elapsed_ms,
-                },
-                f.size(),
-            );
-        })?;
-
-        // Check for completed timers
-        for state in states.iter_mut() {
-            let rem = state.end_time - now;
-            if rem.num_milliseconds() <= 0 && !state.alert_triggered {
-                state.alert_triggered = true;
-                let label = state.label.clone();
-                thread::spawn(move || do_alert(&label));
+    let result = (|| -> io::Result<()> {
+        loop {
+            if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
             }
-        }
 
-        thread::sleep(Duration::from_millis(80));
+            let now = Local::now();
+            let elapsed_ms = start.elapsed().as_millis() as u64;
 
-        // Check if all done
-        let active = states
-            .iter()
-            .any(|s| (s.end_time - now).num_milliseconds() > 0);
-        if !active && start.elapsed() > Duration::from_millis(500) {
-            if event::poll(Duration::from_millis(10)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.kind == KeyEventKind::Press {
-                        if key.code == KeyCode::Char('q') || key.code == KeyCode::Enter {
-                            break;
+            terminal.draw(|f| {
+                f.render_widget(
+                    TimerWidget {
+                        states: &states,
+                        now,
+                        elapsed_ms,
+                    },
+                    f.size(),
+                );
+            })?;
+
+            // Check for completed timers
+            for state in states.iter_mut() {
+                let rem = state.end_time - now;
+                if rem.num_milliseconds() <= 0 && !state.alert_triggered {
+                    state.alert_triggered = true;
+                    let label = state.label.clone();
+                    thread::spawn(move || do_alert(&label));
+                }
+            }
+
+            thread::sleep(Duration::from_millis(80));
+
+            // Check if all done
+            let active = states
+                .iter()
+                .any(|s| (s.end_time - now).num_milliseconds() > 0);
+            if !active && start.elapsed() > Duration::from_millis(500) {
+                if event::poll(Duration::from_millis(10)).unwrap_or(false) {
+                    if let Ok(Event::Key(key)) = event::read() {
+                        if key.kind == KeyEventKind::Press {
+                            if key.code == KeyCode::Char('q') || key.code == KeyCode::Enter {
+                                break;
+                            }
                         }
                     }
                 }
             }
+
+            last_state = states.clone();
         }
+        Ok(())
+    })();
+
+    // Always clean up terminal
+    cleanup_terminal();
+
+    // Wait for input thread
+    let _ = input_thread.join();
+
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
     }
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    Ok(())
 }
