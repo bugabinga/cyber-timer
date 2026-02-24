@@ -21,7 +21,7 @@ use ratatui::{
 use regex::Regex;
 use rodio::{Decoder, OutputStream, Source};
 use std::{
-    env, io,
+    io,
     io::Cursor,
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -120,8 +120,6 @@ fn parse_labeled_duration(s: &str) -> (String, Duration) {
     }
 }
 
-fn do_alert(label: &str) {
-
 fn parse_timers(args: &[String]) -> Vec<TimerState> {
     args.iter()
         .take(10) // Limit number of timers
@@ -143,6 +141,8 @@ fn parse_timers(args: &[String]) -> Vec<TimerState> {
         })
         .collect()
 }
+
+fn do_alert(label: &str) {
     if let Err(e) = Notification::new()
         .summary("Timer Done!")
         .body(label)
