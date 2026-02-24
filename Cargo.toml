@@ -1,0 +1,35 @@
+[package]
+name = "cyber-timer"
+version = "0.1.0"
+edition = "2021"
+description = "A blazing fast cyberpunk-themed terminal timer"
+readme = "README.md"
+license = "MIT"
+authors = ["Your Name"]
+repository = "https://github.com/yourusername/cyber-timer"
+keywords = ["timer", "tui", "terminal", "cyberpunk", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+chrono = "0.4"
+crossterm = "0.27"
+regex = "1.10"
+ratatui = "0.27"
+tui = "0.19"
+anyhow = "1.0"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+
+[features]
+default = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = 2
