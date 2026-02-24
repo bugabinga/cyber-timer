@@ -5,8 +5,8 @@ edition = "2021"
 description = "A blazing fast cyberpunk-themed terminal timer"
 readme = "README.md"
 license = "MIT"
-authors = ["Your Name"]
-repository = "https://github.com/yourusername/cyber-timer"
+authors = ["bugabinga"]
+repository = "https://github.com/bugabinga/cyber-timer"
 keywords = ["timer", "terminal", "cyberpunk", "cli"]
 categories = ["command-line-utilities"]
 

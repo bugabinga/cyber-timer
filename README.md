@@ -4,9 +4,9 @@ A blazing fast, cyberpunk-themed terminal timer with a dark aesthetic and neon
 pink/cyan accents. Built with Rust and ratatui for maximum performance and
 visual impact.
 
-![CI](https://github.com/yourusername/cyber-timer/workflows/CI/badge.svg)
-![Crates.io](https://img.shields.io/crates/v/cyber-timer)
-![License](https://img.shields.io/github/license/yourusername/cyber-timer)
+[![CI](https://github.com/bugabinga/cyber-timer/actions/workflows/ci.yml/badge.svg)](https://github.com/bugabinga/cyber-timer/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/cyber-timer)](https://crates.io/crates/cyber-timer)
+[![License](https://img.shields.io/github/license/bugabinga/cyber-timer)](LICENSE)
 
 ## Features
 
@@ -23,7 +23,7 @@ visual impact.
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/cyber-timer.git
+git clone https://github.com/bugabinga/cyber-timer.git
 cd cyber-timer
 cargo install --path .
 ```
@@ -31,7 +31,7 @@ cargo install --path .
 ### Pre-built Binaries
 
 Download the latest release for your platform from the
-[releases page](https://github.com/yourusername/cyber-timer/releases).
+[releases page](https://github.com/bugabinga/cyber-timer/releases).
 
 ## Usage
 
