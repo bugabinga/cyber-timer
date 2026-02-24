@@ -35,6 +35,21 @@ Download the latest release for your platform from the
 
 ## Usage
 
+```
+A blazing fast cyberpunk-themed terminal timer
+
+Usage: cyber-timer <TIMERS>...
+
+Arguments:
+  <TIMERS>...  Timer durations (e.g., 30s, 5m, 'work:25m')
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+### Examples
+
 ```bash
 # Simple timer (30 seconds)
 cyber-timer 30s
@@ -83,11 +98,41 @@ cargo build --release
 cargo test
 
 # Format
-cargo fmt --all
+cargo fmt -- --check
 
 # Lint
 cargo clippy --all -- -D warnings
 ```
+
+### Testing with Snapshots
+
+This project uses [insta](https://insta.rs/) for snapshot testing the TUI
+rendering. Snapshot tests capture the exact terminal output and detect
+unintended visual changes.
+
+```bash
+# Run tests (will fail if snapshots don't match)
+cargo test
+
+# Review pending snapshot changes
+cargo insta review
+
+# Accept all pending snapshot changes
+cargo insta accept
+
+# Run tests and automatically accept new snapshots
+cargo insta test --accept
+```
+
+#### Adding New Snapshot Tests
+
+1. Create a test that uses `TestBackend` to render the widget
+2. Use `assert_snapshot!` to capture the output
+3. Run the test - it will create a `.snap.new` file
+4. Review the snapshot with `cargo insta review`
+5. Accept to convert `.snap.new` to `.snap`
+
+Snapshot files are stored in `src/snapshots/`.
 
 ## Architecture
 

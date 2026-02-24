@@ -1,9 +1,13 @@
 use chrono::{DateTime, Duration as ChronoDuration, Local};
+use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::DisableMouseCapture,
+    event::EnableMouseCapture,
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use notify_rust::Notification;
 use ratatui::{
     backend::CrosstermBackend,
     buffer::Buffer,
@@ -15,17 +19,21 @@ use ratatui::{
     Terminal,
 };
 use regex::Regex;
+use rodio::{Decoder, OutputStream, Source};
 use std::{
-    env, io,
-    process::Command,
-    sync::Arc,
+    io,
+    io::Cursor,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
 
-const FALLBACK_SOUND: &str = "/usr/share/sounds/freedesktop/stereo/complete.oga";
+#[cfg(not(debug_assertions))]
+use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::sync::{atomic::AtomicU16, Arc, Mutex};
 
-mod colors {
+pub mod colors {
     use ratatui::style::Color;
     pub const BG: Color = Color::Rgb(8, 8, 15);
     pub const BORDER: Color = Color::Rgb(255, 0, 128);
@@ -36,23 +44,59 @@ mod colors {
     pub const ORANGE: Color = Color::Rgb(255, 140, 0);
     pub const TEXT: Color = Color::Rgb(200, 200, 220);
     pub const TEXT_DIM: Color = Color::Rgb(100, 100, 130);
+    #[cfg(debug_assertions)]
+    pub const MATRIX_GREEN: Color = Color::Rgb(0, 255, 65);
 }
 
-#[derive(Clone)]
-struct TimerState {
+const FALLBACK_SOUND: &[u8] = include_bytes!("../sounds/complete.oga");
+
+const SLEEP_MS: u64 = 80;
+const POLL_MS: u64 = 50;
+const ANIMATION_PHASE_MS: u64 = 150;
+const EXIT_DELAY_MS: u64 = 500;
+#[cfg(debug_assertions)]
+const DIAGNOSTIC_FLICKER_MS: u64 = 200;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Timer durations (e.g., 30s, 5m, 'work:25m')
+    #[arg(name = "TIMERS", required = true)]
+    timers: Vec<String>,
+}
+
+static DURATION_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+fn get_duration_regex() -> &'static Regex {
+    DURATION_REGEX.get_or_init(|| Regex::new(r"(?i)(\d+)(sec|s|min|m|h)").unwrap())
+}
+
+#[derive(Clone, Debug)]
+pub struct TimerState {
     label: String,
     total: Duration,
     end_time: DateTime<Local>,
     alert_triggered: bool,
 }
 
+#[cfg(debug_assertions)]
+struct DiagnosticInfo {
+    pid: u32,
+    resolution: (u16, u16),
+    latency_ms: u64,
+    last_key: Option<String>,
+    states: Vec<TimerState>,
+    scroll_offset: u16,
+}
+
 fn parse_duration(s: &str) -> Duration {
-    let re = Regex::new(r"(\d+)(sec|s|min|h)").unwrap();
-    if let Some(caps) = re.captures(s) {
+    let re = get_duration_regex();
+    if let Some(caps) = re.captures(s.trim()) {
         let val: u64 = caps[1].parse().unwrap_or(10);
-        match &caps[2] {
-            "min" => Duration::from_secs(val * 60),
+        match caps[2].to_lowercase().as_str() {
+            "min" | "m" => Duration::from_secs(val * 60),
             "h" => Duration::from_secs(val * 3600),
+            "sec" | "s" => Duration::from_secs(val),
             _ => Duration::from_secs(val),
         }
     } else {
@@ -62,17 +106,62 @@ fn parse_duration(s: &str) -> Duration {
 
 fn parse_labeled_duration(s: &str) -> (String, Duration) {
     if let Some((label, duration_str)) = s.split_once(':') {
-        (label.to_string(), parse_duration(duration_str))
+        let trimmed_label = label.trim();
+        (
+            if trimmed_label.is_empty() {
+                "Timer".to_string()
+            } else {
+                trimmed_label.to_string()
+            },
+            parse_duration(duration_str),
+        )
     } else {
         ("Timer".to_string(), parse_duration(s))
     }
 }
 
+fn parse_timers(args: &[String]) -> Vec<TimerState> {
+    args.iter()
+        .take(10) // Limit number of timers
+        .enumerate()
+        .map(|(i, s)| {
+            let (label, d) = parse_labeled_duration(s);
+            let end_time = Local::now()
+                + ChronoDuration::from_std(d).unwrap_or_else(|_| ChronoDuration::days(365 * 10));
+            TimerState {
+                label: if i > 0 && label == "Timer" {
+                    format!("Task {}", i + 1)
+                } else {
+                    label
+                },
+                total: d,
+                end_time,
+                alert_triggered: false,
+            }
+        })
+        .collect()
+}
+
 fn do_alert(label: &str) {
-    let _ = Command::new("notify-send")
-        .args(["-t", "6000", "-i", "alarm-clock", "🎯 Timer Done!", label])
-        .spawn();
-    let _ = Command::new("pw-play").arg(FALLBACK_SOUND).spawn();
+    if let Err(e) = Notification::new()
+        .summary("Timer Done!")
+        .body(label)
+        .icon("alarm-clock")
+        .timeout(6000)
+        .show()
+    {
+        log::warn!("Failed to send notification: {}", e);
+    }
+
+    let sound_data = FALLBACK_SOUND.to_vec();
+    thread::spawn(move || {
+        if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
+            if let Ok(source) = Decoder::new(Cursor::new(sound_data)) {
+                let _ = stream_handle.play_raw(source.convert_samples());
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+    });
 }
 
 fn get_bar_color(progress: f64) -> Color {
@@ -108,7 +197,7 @@ fn create_bar(progress: f64, width: usize, elapsed_ms: u64) -> String {
     let filled = ((progress * width as f64) as usize).min(width);
     let empty = width.saturating_sub(filled);
 
-    let phase = (elapsed_ms / 150) % 4;
+    let phase = (elapsed_ms / ANIMATION_PHASE_MS) % 4;
 
     let edge = match phase {
         0 => "▓",
@@ -128,7 +217,7 @@ fn create_bar(progress: f64, width: usize, elapsed_ms: u64) -> String {
     }
 }
 
-struct TimerWidget<'a> {
+pub struct TimerWidget<'a> {
     states: &'a [TimerState],
     now: DateTime<Local>,
     elapsed_ms: u64,
@@ -210,6 +299,10 @@ impl<'a> Widget for TimerWidget<'a> {
         let mut y = inner.y;
 
         for state in self.states.iter().take(num_timers) {
+            if state.total.as_millis() == 0 {
+                continue;
+            }
+
             let rem = state.end_time - self.now;
             let expired = rem.num_milliseconds() <= 0;
 
@@ -280,8 +373,9 @@ impl<'a> Widget for TimerWidget<'a> {
             .filter(|s| (s.end_time - self.now).num_milliseconds() > 0)
             .count();
         let done = self.states.len() - active;
+        let all_complete = active == 0 && !self.states.is_empty();
 
-        let footer_text = if active == 0 && !self.states.is_empty() {
+        let footer_text = if all_complete {
             "  ✨ ALL COMPLETE! Press [q] or [Enter] to exit  "
         } else {
             &format!(
@@ -290,7 +384,7 @@ impl<'a> Widget for TimerWidget<'a> {
             )
         };
 
-        let footer_color = if active == 0 && !self.states.is_empty() {
+        let footer_color = if all_complete {
             colors::GREEN
         } else {
             colors::TEXT_DIM
@@ -309,60 +403,70 @@ impl<'a> Widget for TimerWidget<'a> {
     }
 }
 
+#[cfg(debug_assertions)]
+struct DiagnosticWidget {
+    info: DiagnosticInfo,
+    elapsed_ms: u64,
+}
+
+#[cfg(debug_assertions)]
+impl Widget for DiagnosticWidget {
+    fn render(self, area: ratatui::prelude::Rect, buf: &mut Buffer) {
+        let flicker = (self.elapsed_ms / DIAGNOSTIC_FLICKER_MS).is_multiple_of(2);
+        let title = if flicker {
+            " [ 💾 SYSTEM_KERNEL_DUMP ] "
+        } else {
+            " [ ⚡ SYSTEM_KERNEL_DUMP ] "
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(colors::PINK_NEON))
+            .title(title)
+            .title_style(Style::default().fg(colors::CYAN).bold());
+
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let debug_text = format!(
+            "PID: {}\nRES: {}x{}\nLAT: {}ms\nKEY: {:?}\n\nCORE_STATES:\n{:#?}",
+            self.info.pid,
+            self.info.resolution.0,
+            self.info.resolution.1,
+            self.info.latency_ms,
+            self.info.last_key.unwrap_or_else(|| "NONE".to_string()),
+            self.info.states
+        );
+
+        Paragraph::new(debug_text)
+            .style(Style::default().fg(colors::MATRIX_GREEN))
+            .scroll((self.info.scroll_offset, 0))
+            .render(inner, buf);
+    }
+}
+
 fn cleanup_terminal() {
-    // Try to restore terminal state - ignore errors
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1000l");
-    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1002l");
-    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1049l");
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1000l\x1b[?1002l\x1b[?1049l");
 }
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     // Set up panic hook to always clean up terminal
     std::panic::set_hook(Box::new(|_| {
         cleanup_terminal();
         eprintln!("\nPanic occurred, terminal cleaned up.");
     }));
 
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
-        println!("🎮 CyberTimer v0.1.0");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("Usage: cyber-timer 30s 5m 'work:25m'");
-        println!();
-        println!("Examples:");
-        println!("  cyber-timer 30s          # 30 second timer");
-        println!("  cyber-timer 5m 2m       # 5 min, then 2 min");
-        println!("  cyber-timer 'work:25m'  # named timer");
-        println!("  cyber-timer 25m 5m 25m  # pomodoro!");
-        println!();
-        println!("Controls: Enter/q = exit, Ctrl+C = force quit");
+    let args = Args::parse();
+    let mut states = parse_timers(&args.timers);
+
+    if states.is_empty() {
         return;
     }
-
-    // Limit number of timers
-    let args: Vec<String> = args.into_iter().take(10).collect();
-
-    let mut states: Vec<TimerState> = args
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let (label, d) = parse_labeled_duration(s);
-            TimerState {
-                label: if i == 0 {
-                    label
-                } else if label == "Timer" {
-                    format!("Task {}", i + 1)
-                } else {
-                    label
-                },
-                total: d,
-                end_time: Local::now() + ChronoDuration::from_std(d).unwrap(),
-                alert_triggered: false,
-            }
-        })
-        .collect();
 
     // Set up terminal
     let mut stdout = io::stdout();
@@ -379,49 +483,160 @@ fn main() {
         }
     };
 
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
+
+    #[cfg(debug_assertions)]
+    let debug_enabled = Arc::new(AtomicBool::new(false));
+    #[cfg(debug_assertions)]
+    let debug_enabled_clone = debug_enabled.clone();
+    #[cfg(debug_assertions)]
+    let last_key = Arc::new(Mutex::new(None));
+    #[cfg(debug_assertions)]
+    let last_key_clone = last_key.clone();
+    #[cfg(debug_assertions)]
+    let scroll_offset = Arc::new(AtomicU16::new(0));
+    #[cfg(debug_assertions)]
+    let scroll_offset_clone = scroll_offset.clone();
 
     // Input handling thread
     let input_thread = thread::spawn(move || {
-        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            if event::poll(Duration::from_millis(50)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.kind == KeyEventKind::Press {
-                        if key.code == KeyCode::Char('q') || key.code == KeyCode::Enter {
-                            running_clone.store(false, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(event::KeyModifiers::CONTROL)
-                        {
-                            running_clone.store(false, std::sync::atomic::Ordering::Relaxed);
+        while running_clone.load(Ordering::Relaxed) {
+            if event::poll(Duration::from_millis(POLL_MS)).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if key.kind == KeyEventKind::Press {
+                            #[cfg(debug_assertions)]
+                            {
+                                if let KeyCode::Char(c) = key.code {
+                                    *last_key_clone.lock().unwrap() = Some(c.to_string());
+                                }
+                                if key.code == KeyCode::Char('d') {
+                                    let val = debug_enabled_clone.load(Ordering::Relaxed);
+                                    debug_enabled_clone.store(!val, Ordering::Relaxed);
+                                }
+                                if debug_enabled_clone.load(Ordering::Relaxed) {
+                                    match key.code {
+                                        KeyCode::Up => {
+                                            scroll_offset_clone
+                                                .fetch_update(
+                                                    Ordering::Relaxed,
+                                                    Ordering::Relaxed,
+                                                    |v| {
+                                                        if v > 0 {
+                                                            Some(v.saturating_sub(3))
+                                                        } else {
+                                                            None
+                                                        }
+                                                    },
+                                                )
+                                                .ok();
+                                        }
+                                        KeyCode::Down => {
+                                            scroll_offset_clone.fetch_add(3, Ordering::Relaxed);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
+                            if key.code == KeyCode::Char('q') || key.code == KeyCode::Enter {
+                                running_clone.store(false, Ordering::Relaxed);
+                            }
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(event::KeyModifiers::CONTROL)
+                            {
+                                running_clone.store(false, Ordering::Relaxed);
+                            }
                         }
                     }
+                    #[cfg(debug_assertions)]
+                    Ok(Event::Mouse(mouse)) => {
+                        use crossterm::event::MouseEventKind;
+                        if debug_enabled_clone.load(Ordering::Relaxed) {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    scroll_offset_clone
+                                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                            if v > 0 {
+                                                Some(v.saturating_sub(3))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .ok();
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    scroll_offset_clone.fetch_add(3, Ordering::Relaxed);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     });
 
     let start = Instant::now();
-    let mut last_state = Vec::new();
+
+    #[cfg(debug_assertions)]
+    let mut _last_tick = Instant::now();
 
     let result = (|| -> io::Result<()> {
         loop {
-            if !running.load(std::sync::atomic::Ordering::Relaxed) {
+            if !running.load(Ordering::Relaxed) {
                 break;
             }
 
             let now = Local::now();
             let elapsed_ms = start.elapsed().as_millis() as u64;
 
+            #[cfg(debug_assertions)]
+            let tick_latency = _last_tick.elapsed().as_millis() as u64;
+            #[cfg(debug_assertions)]
+            {
+                _last_tick = Instant::now();
+            }
+
             terminal.draw(|f| {
+                #[cfg(debug_assertions)]
+                let main_area = if debug_enabled.load(Ordering::Relaxed) {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                        .split(f.size());
+
+                    f.render_widget(
+                        DiagnosticWidget {
+                            info: DiagnosticInfo {
+                                pid: std::process::id(),
+                                resolution: (f.size().width, f.size().height),
+                                latency_ms: tick_latency,
+                                last_key: last_key.lock().unwrap().clone(),
+                                states: states.clone(),
+                                scroll_offset: scroll_offset.load(Ordering::Relaxed),
+                            },
+                            elapsed_ms,
+                        },
+                        chunks[1],
+                    );
+                    chunks[0]
+                } else {
+                    f.size()
+                };
+
+                #[cfg(not(debug_assertions))]
+                let main_area = f.size();
+
                 f.render_widget(
                     TimerWidget {
                         states: &states,
                         now,
                         elapsed_ms,
                     },
-                    f.size(),
+                    main_area,
                 );
             })?;
 
@@ -435,25 +650,26 @@ fn main() {
                 }
             }
 
-            thread::sleep(Duration::from_millis(80));
+            thread::sleep(Duration::from_millis(SLEEP_MS));
 
-            // Check if all done
-            let active = states
+            // Check if all done and wait for user input
+            let all_done = !states
                 .iter()
                 .any(|s| (s.end_time - now).num_milliseconds() > 0);
-            if !active && start.elapsed() > Duration::from_millis(500) {
-                if event::poll(Duration::from_millis(10)).unwrap_or(false) {
+            if all_done && start.elapsed() > Duration::from_millis(EXIT_DELAY_MS) {
+                // Keep rendering until user presses q or Enter
+                if event::poll(Duration::from_millis(POLL_MS)).unwrap_or(false) {
                     if let Ok(Event::Key(key)) = event::read() {
-                        if key.kind == KeyEventKind::Press {
-                            if key.code == KeyCode::Char('q') || key.code == KeyCode::Enter {
-                                break;
-                            }
+                        if key.kind == KeyEventKind::Press
+                            && (key.code == KeyCode::Char('q') || key.code == KeyCode::Enter)
+                        {
+                            break;
                         }
                     }
                 }
+                // Continue looping to keep screen visible
+                continue;
             }
-
-            last_state = states.clone();
         }
         Ok(())
     })();
@@ -466,5 +682,160 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, Local};
+    use insta::assert_snapshot;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::time::Duration;
+
+    fn make_timer_state(label: &str, total_secs: u64, progress: f64) -> TimerState {
+        let total = std::time::Duration::from_secs(total_secs);
+        let remaining = (total_secs as f64 * (1.0 - progress)) as i64;
+        let end_time = fixed_time() + ChronoDuration::seconds(remaining);
+        TimerState {
+            label: label.to_string(),
+            total,
+            end_time,
+            alert_triggered: progress >= 1.0,
+        }
+    }
+
+    fn render_timer(states: &[TimerState], elapsed_ms: u64) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    TimerWidget {
+                        states,
+                        now: fixed_time(),
+                        elapsed_ms,
+                    },
+                    f.size(),
+                );
+            })
+            .unwrap();
+
+        terminal.backend().to_string()
+    }
+
+    fn fixed_time() -> DateTime<Local> {
+        Local::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_single_timer() {
+        let states = vec![make_timer_state("Work", 60, 0.5)];
+        let terminal = render_timer(&states, 0);
+        assert_snapshot!(terminal);
+    }
+
+    #[test]
+    fn test_multiple_timers() {
+        let states = vec![
+            make_timer_state("Task 1", 60, 0.25),
+            make_timer_state("Task 2", 120, 0.5),
+            make_timer_state("Task 3", 30, 0.75),
+        ];
+        let terminal = render_timer(&states, 0);
+        assert_snapshot!(terminal);
+    }
+
+    #[test]
+    fn test_completed_timer() {
+        let states = vec![make_timer_state("Done!", 60, 1.0)];
+        let terminal = render_timer(&states, 0);
+        assert_snapshot!(terminal);
+    }
+
+    #[test]
+    fn test_empty_state() {
+        let states: Vec<TimerState> = vec![];
+        let terminal = render_timer(&states, 0);
+        assert_snapshot!(terminal);
+    }
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        assert_eq!(parse_duration("30s"), Duration::from_secs(30));
+        assert_eq!(parse_duration("30sec"), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_parse_duration_minutes() {
+        assert_eq!(parse_duration("5m"), Duration::from_secs(300));
+        assert_eq!(parse_duration("5min"), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        assert_eq!(parse_duration("2h"), Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_parse_duration_invalid() {
+        assert_eq!(parse_duration("invalid"), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_parse_labeled_duration() {
+        let (label, dur) = parse_labeled_duration("work:25m");
+        assert_eq!(label, "work");
+        assert_eq!(dur, Duration::from_secs(1500));
+    }
+
+    #[test]
+    fn test_parse_labeled_duration_no_label() {
+        let (label, dur) = parse_labeled_duration("30s");
+        assert_eq!(label, "Timer");
+        assert_eq!(dur, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_zero_duration_timer() {
+        let states = vec![make_timer_state("Zero", 0, 0.0)];
+        let terminal = render_timer(&states, 0);
+        assert_snapshot!(terminal);
+    }
+
+    #[test]
+    fn test_format_time() {
+        assert_eq!(format_time(0), "00:00");
+        assert_eq!(format_time(30), "00:30");
+        assert_eq!(format_time(60), "01:00");
+        assert_eq!(format_time(90), "01:30");
+        assert_eq!(format_time(3600), "01:00:00");
+        assert_eq!(format_time(3661), "01:01:01");
+    }
+
+    #[test]
+    fn test_parse_duration_performance() {
+        let inputs = ["30s", "5m", "2h", "invalid", "work:25m"];
+
+        let start = Instant::now();
+        for _ in 0..10000 {
+            for input in &inputs {
+                parse_duration(input);
+                parse_labeled_duration(input);
+            }
+        }
+        let elapsed = start.elapsed();
+
+        let ns_per_call = elapsed.as_nanos() / (inputs.len() * 10000) as u128;
+        assert!(
+            ns_per_call < 10000,
+            "parse_duration too slow: {}ns/call",
+            ns_per_call
+        );
     }
 }
